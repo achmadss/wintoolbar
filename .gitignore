@@ -1,0 +1,8 @@
+# Build output
+bin/
+*.exe
+
+# Local logs and editor state
+*.log
+.vscode/
+.idea/

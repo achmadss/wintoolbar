@@ -1,0 +1,50 @@
+name: Release
+
+# Manual only: pick the workflow in the Actions tab and run it. It builds the
+# binary, works out the next version from the conventional commits since the
+# last tag, and opens a draft release with the notes. Publishing stays manual.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  draft:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tags and history are needed to compute the version
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Next version and release notes
+        shell: pwsh
+        run: ./tools/release.ps1 -VersionOut version.txt -NotesOut notes.md
+
+      - name: Build and test
+        shell: pwsh
+        run: ./build.ps1 -Test
+
+      - name: Create draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = (Get-Content version.txt -Raw).Trim()
+          $tag = "v$version"
+          # A draft has no git tag until it is published, so check both.
+          $released = gh release list --limit 100 --json tagName --jq '.[].tagName'
+          if ((git tag --list $tag) -or ($released -contains $tag)) {
+            throw "Tag or release $tag already exists. Publish the draft first, or push more commits."
+          }
+          gh release create $tag bin/wintoolbar.exe `
+            --draft `
+            --title "wintoolbar $tag" `
+            --notes-file notes.md `
+            --target ${{ github.ref_name }}
+          Write-Output "Draft release $tag created with bin/wintoolbar.exe."
