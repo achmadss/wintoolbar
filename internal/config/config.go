@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 )
 
 // Config is the whole user configuration. Missing fields keep their defaults.
@@ -14,7 +15,18 @@ type Config struct {
 	// Visible shows the widget. Hidden means no polling and no capture.
 	Visible bool `json:"visible"`
 
+	// Display is the monitor device name whose taskbar hosts the widget,
+	// such as `\\.\DISPLAY7`. Empty picks the primary taskbar.
+	Display string `json:"display"`
+
+	// Layout is the layout of a display without its own entry in Layouts,
+	// and the template a new entry starts from.
 	Layout Layout `json:"layout"`
+
+	// Layouts holds the layout per display device name. The values are
+	// pointers so LayoutFor can hand out the stored layout itself; map
+	// values are not addressable.
+	Layouts map[string]*Layout `json:"layouts,omitempty"`
 
 	Visualizer Visualizer `json:"visualizer"`
 	Media      Media      `json:"media"`
@@ -81,6 +93,39 @@ func (l *Layout) Zone(z int) *[]string {
 		return &l.Right
 	}
 }
+
+// clone copies the layout and its zone slices.
+func (l Layout) clone() Layout {
+	return Layout{
+		Left:         slices.Clone(l.Left),
+		Center:       slices.Clone(l.Center),
+		Right:        slices.Clone(l.Right),
+		LeftOffset:   l.LeftOffset,
+		CenterOffset: l.CenterOffset,
+		RightOffset:  l.RightOffset,
+	}
+}
+
+// LayoutFor returns the layout of a display device name. The first call seeds
+// the entry with a deep copy of Layout, so editing one display leaves the
+// others alone. An empty name is the primary taskbar and uses Layout itself.
+func (c *Config) LayoutFor(device string) *Layout {
+	if device == "" {
+		return &c.Layout
+	}
+	if l, ok := c.Layouts[device]; ok && l != nil {
+		return l
+	}
+	l := c.Layout.clone()
+	if c.Layouts == nil {
+		c.Layouts = make(map[string]*Layout, 2)
+	}
+	c.Layouts[device] = &l
+	return &l
+}
+
+// DisplayLayout returns the layout of the display the widget runs on.
+func (c *Config) DisplayLayout() *Layout { return c.LayoutFor(c.Display) }
 
 // Find returns the zone and index of section id, or -1, -1.
 func (l *Layout) Find(id string) (zone, index int) {
@@ -227,6 +272,13 @@ func Load() (Config, error) {
 
 func (c *Config) normalize() {
 	c.Layout.normalize()
+	for device, l := range c.Layouts {
+		if device == "" || l == nil {
+			delete(c.Layouts, device) // the primary taskbar uses Layout
+			continue
+		}
+		l.normalize()
+	}
 	v := &c.Visualizer
 	v.Bars = clamp(v.Bars, 1, 20)
 	v.Sensitivity = clamp(v.Sensitivity, 1, 3)

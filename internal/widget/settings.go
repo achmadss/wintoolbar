@@ -38,6 +38,15 @@ var sectionLabels = map[string]string{
 	config.SectionNetwork:    "Network monitor",
 }
 
+// displayLabel names a taskbar entry: device, monitor size, primary marker.
+func displayLabel(t win.Taskbar) string {
+	label := fmt.Sprintf("%s (%dx%d)", strings.TrimPrefix(t.Device, `\\.\`), t.Monitor.W(), t.Monitor.H())
+	if t.Primary {
+		label += " — primary"
+	}
+	return label
+}
+
 type settingsWin struct {
 	hwnd uintptr
 	font uintptr
@@ -50,6 +59,8 @@ type settingsWin struct {
 	loading  bool // true while filling controls: handlers ignore events
 
 	// Layout page.
+	display  uintptr  // display combo
+	displays []string // combo values in entry order, "" = primary taskbar
 	lists    [config.ZoneCount]uintptr
 	offsets  [config.ZoneCount]uintptr
 	selected string // section ID selected in a zone list
@@ -192,6 +203,37 @@ func (s *settingsWin) build(a *App) {
 
 	// --- Layout page ---
 	y := top
+	s.label(0, "Display", x, y, sLabelW)
+	s.display = s.ctl(0, "COMBOBOX", "", win.CBS_DROPDOWNLIST|win.WS_VSCROLL|win.WS_TABSTOP, x+sLabelW, y, inner-sLabelW, 200)
+	// Filled here, not in load: the attached taskbars are read when the
+	// window opens, and rebuilding the list from inside its own
+	// CBN_SELCHANGE handler would reset the combo it is handling.
+	for _, t := range win.Taskbars() {
+		v := ""
+		if !t.Primary {
+			if t.Device == "" {
+				continue
+			}
+			v = t.Device
+		}
+		s.displays = append(s.displays, v)
+		win.SendMessageStr(s.display, win.CB_ADDSTRING, 0, displayLabel(t))
+	}
+	s.on(s.display, func(code uint32) {
+		if code != win.CBN_SELCHANGE {
+			return
+		}
+		i := int(win.SendMessage(s.display, win.CB_GETCURSEL, 0, 0))
+		if i < 0 || i >= len(s.displays) {
+			return
+		}
+		// Every display has its own layout: switch, then show that one.
+		cfg.Display = s.displays[i]
+		a.save()
+		a.apply()
+		s.load(a)
+	})
+	y += sRow + 4
 	s.check(0, "Show widget in the taskbar", x, y, inner/2, func(on bool) { cfg.Visible = on; s.changed(a) })
 	s.autostart = s.check(0, "Start with Windows", x+inner/2, y, inner/2, func(on bool) {
 		if err := setAutostart(on); err != nil {
@@ -214,7 +256,7 @@ func (s *settingsWin) build(a *App) {
 				return
 			}
 			i := int(win.SendMessage(lb, win.LB_GETCURSEL, 0, 0))
-			list := *cfg.Layout.Zone(zone)
+			list := *cfg.DisplayLayout().Zone(zone)
 			if i >= 0 && i < len(list) {
 				s.selected = list[i]
 			}
@@ -254,13 +296,14 @@ func (s *settingsWin) build(a *App) {
 				return
 			}
 			v = min(max(v, lo), hi)
+			lay := cfg.DisplayLayout()
 			switch zone {
 			case config.ZoneLeft:
-				cfg.Layout.LeftOffset = v
+				lay.LeftOffset = v
 			case config.ZoneCenter:
-				cfg.Layout.CenterOffset = v
+				lay.CenterOffset = v
 			default:
-				cfg.Layout.RightOffset = v
+				lay.RightOffset = v
 			}
 			s.changed(a)
 		})
@@ -395,8 +438,10 @@ func (s *settingsWin) load(a *App) {
 	}
 	setCheck(byText(0, "Show widget in the taskbar"), cfg.Visible)
 	setCheck(s.autostart, autostartEnabled())
+	s.selectDisplay(a)
+	lay := cfg.DisplayLayout()
 	for z := range config.ZoneCount {
-		v := []int{cfg.Layout.LeftOffset, cfg.Layout.CenterOffset, cfg.Layout.RightOffset}[z]
+		v := []int{lay.LeftOffset, lay.CenterOffset, lay.RightOffset}[z]
 		win.SetWindowText(s.offsets[z], strconv.Itoa(v))
 	}
 	s.fillLists(a)
@@ -423,12 +468,30 @@ func (s *settingsWin) load(a *App) {
 	s.refreshEnabled(a)
 }
 
+// selectDisplay marks the combo entry of the taskbar the widget runs on. It
+// falls back to the primary entry, which is what apply does when the
+// configured display is gone.
+func (s *settingsWin) selectDisplay(a *App) {
+	want := a.display
+	if want == "" {
+		want = a.cfg.Display // hidden widget: no live taskbar chosen yet
+	}
+	sel := 0
+	for i, v := range s.displays {
+		if v == want {
+			sel = i
+			break
+		}
+	}
+	win.SendMessage(s.display, win.CB_SETCURSEL, uintptr(sel), 0)
+}
+
 // fillLists shows each zone's sections; disabled sections are marked.
 func (s *settingsWin) fillLists(a *App) {
 	for z := range config.ZoneCount {
 		lb := s.lists[z]
 		win.SendMessage(lb, win.LB_RESETCONTENT, 0, 0)
-		for _, id := range *a.cfg.Layout.Zone(z) {
+		for _, id := range *a.cfg.DisplayLayout().Zone(z) {
 			text := sectionLabels[id]
 			if sec := a.sectionByID(id); sec != nil && !sec.enabled(a) {
 				text += " (off)"
@@ -441,7 +504,7 @@ func (s *settingsWin) fillLists(a *App) {
 
 // syncSelection highlights the selected section in its zone and clears the others.
 func (s *settingsWin) syncSelection(a *App) {
-	z, i := a.cfg.Layout.Find(s.selected)
+	z, i := a.cfg.DisplayLayout().Find(s.selected)
 	for k := range config.ZoneCount {
 		sel := ^uintptr(0) // -1: no selection
 		if k == z {
@@ -453,7 +516,8 @@ func (s *settingsWin) syncSelection(a *App) {
 
 // move shifts the selected section by dz zones or di places.
 func (s *settingsWin) move(a *App, dz, di int) {
-	z, i := a.cfg.Layout.Find(s.selected)
+	lay := a.cfg.DisplayLayout()
+	z, i := lay.Find(s.selected)
 	if z < 0 {
 		return
 	}
@@ -463,15 +527,15 @@ func (s *settingsWin) move(a *App, dz, di int) {
 		if nz == z {
 			return
 		}
-		ni = len(*a.cfg.Layout.Zone(nz)) // append at the end of the new zone
+		ni = len(*lay.Zone(nz)) // append at the end of the new zone
 		if dz > 0 {
 			ni = 0 // moving right: enter at the start, next to where it was
 		}
 	}
-	if ni < 0 || (dz == 0 && ni >= len(*a.cfg.Layout.Zone(z))) {
+	if ni < 0 || (dz == 0 && ni >= len(*lay.Zone(z))) {
 		return
 	}
-	a.cfg.Layout.Move(s.selected, nz, ni)
+	lay.Move(s.selected, nz, ni)
 	s.fillLists(a)
 	s.changed(a)
 }

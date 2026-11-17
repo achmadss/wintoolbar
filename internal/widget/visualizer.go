@@ -3,6 +3,7 @@ package widget
 import (
 	"strconv"
 	"strings"
+	"time"
 
 	"wintoolbar/internal/audio"
 	"wintoolbar/internal/viz"
@@ -11,7 +12,7 @@ import (
 
 // Visualizer box, from FluentFlyout TaskbarVisualizerControl: an 84x40
 // control whose 4 px side margins leave a 76x32 bar area, centered.
-// Bars are 2 px apart with a 2 px corner radius at 10 bars.
+// Bars are 2 px apart, with a half-circle cap the width of the bar.
 const (
 	vizBoxW    = 84
 	vizBarsW   = 76
@@ -25,6 +26,7 @@ type vizSection struct {
 	spec    *viz.Spectrum
 	buf     [audio.RingSize]float32
 	lastN   uint64
+	lastT   time.Time
 
 	running bool
 	ticking bool
@@ -63,6 +65,7 @@ func (v *vizSection) stop() {
 	v.capture.Stop()
 	v.setTicking(false)
 	clear(v.spec.Bars)
+	clear(v.spec.Peaks)
 	v.visible = false
 }
 
@@ -71,6 +74,7 @@ func (v *vizSection) setTicking(on bool) {
 		return
 	}
 	if on {
+		v.lastT = time.Now()
 		win.SetTimer(app.host, timerRender, vizFrameMs)
 	} else {
 		win.KillTimer(app.host, timerRender)
@@ -85,8 +89,8 @@ func (v *vizSection) wake(a *App) {
 	}
 }
 
-// tick is one 33 ms frame. It stops itself once the bars have decayed and
-// no new audio arrives; the capture thread wakes it again.
+// tick is one 33 ms frame. It stops itself once the bars and peak markers
+// have decayed and no new audio arrives; the capture thread wakes it again.
 func (v *vizSection) tick(a *App) {
 	if !v.running {
 		v.setTicking(false)
@@ -94,6 +98,14 @@ func (v *vizSection) tick(a *App) {
 	}
 	n := v.capture.Latest(&v.buf)
 	fresh := n != v.lastN
+	// Real frame time, not the timer period: SetTimer coalesces under load and
+	// the peak markers must fall at a fixed rate in wall time.
+	now := time.Now()
+	dt := int32(now.Sub(v.lastT) / time.Millisecond)
+	v.lastT = now
+	if dt < 1 || dt > 4*vizFrameMs {
+		dt = vizFrameMs
+	}
 	var visible bool
 	if fresh && v.capture.SampleRate() > 0 {
 		v.lastN = n
@@ -102,11 +114,12 @@ func (v *vizSection) tick(a *App) {
 	} else {
 		visible = v.spec.Decay()
 	}
-	if visible || v.visible {
+	peaks := v.spec.Hold(dt, vizBarsH)
+	if visible || peaks || v.visible {
 		v.redraw(a)
 	}
 	v.visible = visible
-	if !visible && !fresh {
+	if !visible && !peaks && !fresh {
 		v.setTicking(false)
 		v.capture.SetIdle(true)
 	}
@@ -135,10 +148,9 @@ func (v *vizSection) draw(a *App) {
 	if c.Baseline && !(c.BaselineAutoHide && !v.visible && !anyBar(v.spec.Bars)) {
 		baseline = max(1, (4*a.scale(100)+150)/300) // 4 px at 3x supersampling
 	}
-	radius := float32(a.scale(200)) / 100 / max(1, float32(c.Bars)/10)
 	viz.Draw(surf.pix, surf.w, x, y, bw, bh, v.spec.Bars, viz.Style{
 		Color: v.color, Centered: c.Centered, Baseline: baseline,
-		Spacing: a.scale(vizSpacing), Radius: radius,
+		Spacing: a.scale(vizSpacing), Peaks: v.spec.Peaks,
 	})
 }
 

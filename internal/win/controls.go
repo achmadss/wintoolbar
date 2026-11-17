@@ -168,11 +168,13 @@ func AdjustWindowRectForDpi(r *Rect, style, exStyle, dpi uint32) {
 	procAdjustWindowRectExForDpi.Call(uintptr(unsafe.Pointer(r)), uintptr(style), 0, uintptr(exStyle), uintptr(dpi))
 }
 
+// monitorInfo is MONITORINFOEXW: the trailing szDevice names the display.
 type monitorInfo struct {
 	Size    uint32
 	Monitor Rect
 	Work    Rect
 	Flags   uint32
+	Device  [32]uint16
 }
 
 // MonitorAt returns the work area and DPI of the monitor containing pt.

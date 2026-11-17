@@ -25,6 +25,10 @@ const (
 	maxFreq = 8000.0
 )
 
+// peakFallPxPerSec is the peak-hold fall rate in pixels per second, measured
+// in the bar area's logical pixels so a marker falls at the same speed at any DPI.
+const peakFallPxPerSec = 72.0
+
 // Spectrum holds FFT scratch space and the smoothed bars. Not safe for concurrent use.
 type Spectrum struct {
 	re, im  [N]float32
@@ -34,6 +38,7 @@ type Spectrum struct {
 	rev     [N]uint16
 	current []float32
 	Bars    []float32 // smoothed 0..1 values
+	Peaks   []float32 // peak-hold markers, same 0..1 scale as Bars
 }
 
 // New builds the window and twiddle tables.
@@ -61,6 +66,33 @@ func (s *Spectrum) SetBars(n int) {
 	}
 	s.Bars = make([]float32, n)
 	s.current = make([]float32, n)
+	s.Peaks = make([]float32, n)
+}
+
+// Hold advances the peak-hold markers by dtMs of frame time and returns true
+// while any marker is still visible. A marker jumps to a new peak at once and
+// falls at peakFallPxPerSec, so it trails the bar instead of sticking to it.
+// h is the bar area height in pixels.
+func (s *Spectrum) Hold(dtMs, h int32) bool {
+	if h <= 0 || len(s.Peaks) != len(s.Bars) {
+		return false
+	}
+	// Fall per frame, in normalized units: pixels per second over the bar height.
+	fall := float32(peakFallPxPerSec) * float32(max(dtMs, 0)) / (1000 * float32(h))
+	any := false
+	for i := range s.Peaks {
+		p := max(s.Peaks[i], s.Bars[i]) - fall
+		if p < s.Bars[i] {
+			p = s.Bars[i] // never sink below the bar it trails
+		}
+		if p > 1/512.0 {
+			s.Peaks[i] = p
+			any = true
+		} else {
+			s.Peaks[i] = 0 // decayed to nothing: stop the render tick
+		}
+	}
+	return any
 }
 
 // Decay lowers the bars toward zero without new audio. It returns true while any bar is visible.

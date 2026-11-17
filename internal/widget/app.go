@@ -22,6 +22,7 @@ const (
 	msgAudio        = win.WM_APP + 2 // audio arrived while the render tick was stopped
 	msgMedia        = win.WM_APP + 3 // media session state changed
 	msgOpenSettings = win.WM_APP + 4
+	msgConfig       = win.WM_APP + 5 // config.json changed on disk
 
 	hostClass   = "wintoolbar.host"
 	widgetClass = "wintoolbar.widget"
@@ -61,8 +62,13 @@ type App struct {
 	tray           tray
 
 	taskbar uintptr
+	display string // monitor device name of the chosen taskbar, "" = primary
 	dpi     uint32
 	light   bool // taskbar uses the light theme
+
+	// fullscreen is true while a window covers the taskbar's monitor. Capture
+	// and rendering stop then; the taskbar is not visible anyway.
+	fullscreen bool
 
 	zones [config.ZoneCount]zone
 
@@ -73,6 +79,8 @@ type App struct {
 	net   netSection
 
 	settings settingsWin
+
+	stopWatch func() // ends the config.json watcher
 }
 
 var app *App
@@ -112,6 +120,9 @@ func Run(cfg config.Config) error {
 	}
 	a.readTheme()
 	a.apply()
+	// Hand edits to config.json apply without a restart. The callback runs on
+	// the watcher goroutine, so it only posts to the window.
+	a.stopWatch = config.Watch(func() { win.PostMessage(a.host, msgConfig, 0, 0) })
 
 	var m win.Msg
 	for win.GetMessage(&m) {
@@ -121,6 +132,9 @@ func Run(cfg config.Config) error {
 		}
 		win.TranslateMessage(&m)
 		win.DispatchMessage(&m)
+	}
+	if a.stopWatch != nil {
+		a.stopWatch()
 	}
 	a.settings.close()
 	a.stopAll()
@@ -154,26 +168,37 @@ func (a *App) stopAll() {
 
 // apply brings windows, capture and timers in line with the config.
 func (a *App) apply() {
-	// Assign enabled sections to zones in config order.
+	// Assign enabled sections to zones in config order, for the layout of the
+	// display the widget runs on.
+	lay := a.cfg.DisplayLayout()
 	a.vis.zone, a.media.zone, a.net.zone = nil, nil, nil
 	any := false
 	for i := range a.zones {
 		z := &a.zones[i]
 		z.sections = z.sections[:0]
-		for _, id := range *a.cfg.Layout.Zone(i) {
+		for _, id := range *lay.Zone(i) {
 			if s := a.sectionByID(id); s != nil && s.enabled(a) {
 				z.sections = append(z.sections, s)
 				any = true
 			}
 		}
 	}
-	tb := win.FindWindow("Shell_TrayWnd")
+	tb, display := a.pickTaskbar()
 	if !a.cfg.Visible || !any || tb == 0 {
 		// Hidden, or the taskbar is not there yet (TaskbarCreated retries).
 		a.stopAll()
 		return
 	}
+	if tb != a.taskbar {
+		// The taskbar changed (display switch, Explorer restart): the zone
+		// windows are children of the old one, and ensureZone would see a
+		// stale parent.
+		for i := range a.zones {
+			a.destroyZone(&a.zones[i])
+		}
+	}
 	a.taskbar = tb
+	a.display = display
 	a.dpi = win.GetDpiForWindow(tb)
 	a.net.measure(a)
 	a.media.measure(a)
@@ -186,7 +211,7 @@ func (a *App) apply() {
 	} else {
 		a.net.stop()
 	}
-	if a.cfg.Visualizer.Enabled {
+	if a.cfg.Visualizer.Enabled && !a.fullscreen {
 		a.vis.start()
 	} else {
 		a.vis.stop()
@@ -198,6 +223,26 @@ func (a *App) apply() {
 	}
 	a.vis.readColor(a)
 	a.layout(true)
+}
+
+// pickTaskbar returns the taskbar of the configured display and the display
+// name to remember for it. An empty name means the primary taskbar: it is the
+// choice when no display is configured, when the configured display is the
+// primary one, and when the configured display has no taskbar right now. The
+// config keeps its value in the last case, so replugging the display moves the
+// widget back.
+func (a *App) pickTaskbar() (hwnd uintptr, display string) {
+	if a.cfg.Display != "" {
+		for _, t := range win.Taskbars() {
+			if t.Device != "" && t.Device == a.cfg.Display {
+				if t.Primary {
+					return t.Hwnd, ""
+				}
+				return t.Hwnd, t.Device
+			}
+		}
+	}
+	return win.PrimaryTaskbar(), ""
 }
 
 // ensureZone creates or destroys the zone window to match its sections.
@@ -233,9 +278,14 @@ func (a *App) destroyZone(z *zone) {
 }
 
 // taskbarAlive reports whether the zone windows still sit in the live taskbar.
+// A restart of Explorer, a display that went away or a switched display all
+// kill the chosen taskbar window, and for the primary taskbar a new window
+// takes its place; the 1 s poll recovers through apply.
 func (a *App) taskbarAlive() bool {
-	tb := win.FindWindow("Shell_TrayWnd")
-	if tb == 0 || tb != a.taskbar {
+	if !win.IsWindow(a.taskbar) {
+		return false
+	}
+	if a.display == "" && win.PrimaryTaskbar() != a.taskbar {
 		return false
 	}
 	for i := range a.zones {
@@ -271,12 +321,32 @@ func (a *App) onSecond() {
 		a.apply()
 		return
 	}
+	if fs := fullscreenOnTop(a.taskbar); fs != a.fullscreen {
+		a.fullscreen = fs
+		a.setFullscreen(fs)
+	}
+	if a.fullscreen {
+		return // covered: skip the poll too
+	}
 	changed := a.net.poll()
 	moved := a.layout(false)
 	if changed && a.net.zone != nil && !moved[a.net.zone.id] && a.begin(a.net.zone) {
 		a.net.draw(a)
 		a.present(a.net.zone)
 	}
+}
+
+// setFullscreen stops capture and the render tick while fullscreen content
+// covers the taskbar, and repaints the zones when it ends.
+func (a *App) setFullscreen(on bool) {
+	if on {
+		a.vis.stop()
+		return
+	}
+	if a.cfg.Visualizer.Enabled {
+		a.vis.start()
+	}
+	a.layout(true) // repaint, and drop the stale frame the bars left
 }
 
 func (a *App) scale(v int32) int32 { return (v*int32(a.dpi) + 48) / 96 }
@@ -318,7 +388,7 @@ func (a *App) layout(force bool) (redrawn [config.ZoneCount]bool) {
 			rightEdge = win.ScreenToClientRect(a.taskbar, r).Left
 		}
 	}
-	lay := &a.cfg.Layout
+	lay := a.cfg.DisplayLayout()
 
 	for i := range a.zones {
 		z := &a.zones[i]
@@ -413,6 +483,23 @@ func (a *App) save() {
 	}
 }
 
+// reload applies config.json after it changed on disk. A file that does not
+// parse keeps the running config: Load would hand back defaults, and replacing
+// live settings with defaults because of a typo is worse than ignoring it.
+func (a *App) reload() {
+	if a.settings.hwnd != 0 {
+		return // the open window owns the live values; its saves would echo
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		log.Printf("reload config: %v", err)
+		return
+	}
+	a.cfg = cfg
+	a.readTheme()
+	a.apply()
+}
+
 func (a *App) hostProc(h uintptr, msg uint32, wp, lp uintptr) uintptr {
 	switch msg {
 	case win.WM_TIMER:
@@ -434,6 +521,9 @@ func (a *App) hostProc(h uintptr, msg uint32, wp, lp uintptr) uintptr {
 		return 0
 	case msgOpenSettings:
 		a.openSettings()
+		return 0
+	case msgConfig:
+		a.reload()
 		return 0
 	case msgTray:
 		switch uint32(lp & 0xFFFF) {
